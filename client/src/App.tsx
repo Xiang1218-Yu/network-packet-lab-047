@@ -152,6 +152,7 @@ function App() {
               <div className="metadata-grid">
                 <Meta label="SOURCE" value={packet?.metadata.source ?? '—'} />
                 <Meta label="DESTINATION" value={packet?.metadata.destination ?? '—'} />
+                <Meta label="DIRECTION" value={packet?.metadata.direction ?? 'unknown'} />
                 <Meta label="CAPTURED AT" value={packet?.metadata.capturedAt ?? '—'} />
                 <Meta label="CHECKSUM" value={packet?.metadata.checksum ?? '—'} />
               </div>

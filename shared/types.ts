@@ -1,5 +1,6 @@
 export type Protocol = 'HTTP' | 'TCP';
 export type PacketScenario = 'request' | 'response' | 'handshake';
+export type EndpointDirection = 'client-to-server' | 'server-to-client' | 'unknown';
 
 export interface HexRow {
   offset: string;
@@ -34,6 +35,7 @@ export interface SimulatedPacket {
   timeline: TimelineEvent[];
   metadata: {
     capturedAt: string;
+    direction: EndpointDirection;
     source: string;
     destination: string;
     length: number;

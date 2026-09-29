@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type CSSProperties } from 'react';
 import type {
+  EndpointDirection,
   PacketScenario,
   ParseRequest,
   Protocol,
@@ -14,6 +15,12 @@ const scenarioLabels: Record<PacketScenario, string> = {
   request: '请求 / Request',
   response: '响应 / Response',
   handshake: '握手 / Handshake'
+};
+
+const directionLabels: Record<EndpointDirection, string> = {
+  'client-to-server': '客户端 → 服务端',
+  'server-to-client': '服务端 → 客户端',
+  unknown: '未知 / UNKNOWN'
 };
 
 function App() {
@@ -150,8 +157,9 @@ function App() {
             <div className="panel packet-summary">
               <div className="summary-top"><div><p className="section-kicker">ACTIVE FRAME</p><h3>{packet?.summary ?? '等待数据包'}</h3></div><div className="live-chip"><i /> DECODED</div></div>
               <div className="metadata-grid">
-                <Meta label="SOURCE" value={packet?.metadata.source ?? '—'} />
-                <Meta label="DESTINATION" value={packet?.metadata.destination ?? '—'} />
+                <Meta label="DIRECTION" value={packet ? directionLabels[packet.metadata.direction] : '—'} />
+                <Meta label="SOURCE" value={packet?.metadata.source ?? '未知 / UNKNOWN'} />
+                <Meta label="DESTINATION" value={packet?.metadata.destination ?? '未知 / UNKNOWN'} />
                 <Meta label="CAPTURED AT" value={packet?.metadata.capturedAt ?? '—'} />
                 <Meta label="CHECKSUM" value={packet?.metadata.checksum ?? '—'} />
               </div>

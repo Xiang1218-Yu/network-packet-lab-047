@@ -1,5 +1,12 @@
 import express, { type Request, type Response } from 'express';
+import {
+  classifyHttpMessage,
+  deriveEndpoints,
+  parseTcpRoute,
+  type EndpointInfo
+} from '../shared/endpoints.js';
 import type {
+  EndpointDirection,
   HexRow,
   PacketScenario,
   ParseRequest,
@@ -51,7 +58,7 @@ function field(id: string, key: string, value: string, description: string, chil
   return { id, key, value, description, ...(children ? { children } : {}) };
 }
 
-function parseHttpFields(raw: string): ProtocolField[] {
+function parseHttpFields(raw: string, endpoints: EndpointInfo): ProtocolField[] {
   const [head, body = ''] = raw.split(/\r?\n\r?\n/);
   const lines = head.split(/\r?\n/);
   const startLine = lines.shift() ?? '';
@@ -61,23 +68,26 @@ function parseHttpFields(raw: string): ProtocolField[] {
     const value = separator > -1 ? line.slice(separator + 1).trim() : line.trim();
     return field(`header-${index}`, key, value || '(empty)', 'HTTP header field');
   });
-  const isResponse = startLine.startsWith('HTTP/');
+  const messageKind = classifyHttpMessage(raw);
+  const isResponse = messageKind === 'response';
   const [first, second, third] = startLine.split(' ');
   return [
-    field('http-start-line', isResponse ? 'Status-Line' : 'Request-Line', startLine, isResponse ? 'HTTP version and response status' : 'HTTP method, target and version', [
+    field('http-start-line', isResponse ? 'Status-Line' : 'Request-Line', startLine || '—', isResponse ? 'HTTP version and response status (server → client)' : messageKind === 'request' ? 'HTTP method, target and version (client → server)' : 'Unrecognized HTTP start line; direction unknown', [
       field('http-part-1', isResponse ? 'Version' : 'Method', first ?? '—', isResponse ? 'Protocol version' : 'HTTP request method'),
       field('http-part-2', isResponse ? 'Status' : 'Target', second ?? '—', isResponse ? 'Status code' : 'Request target'),
-      field('http-part-3', isResponse ? 'Reason' : 'Version', isResponse ? (third ?? '—') : (third ?? '—'), isResponse ? 'Reason phrase' : 'Protocol version')
+      field('http-part-3', isResponse ? 'Reason' : 'Version', third ?? '—', isResponse ? 'Reason phrase' : 'Protocol version')
+    ]),
+    field('http-endpoints', 'Endpoints', formatDirection(endpoints.direction), 'Direction derived from the start line', [
+      field('http-source', 'Source', endpoints.source ?? '—', endpoints.source ? endpointRole(endpoints, 'source') : 'Sender cannot be derived from this packet'),
+      field('http-destination', 'Destination', endpoints.destination ?? '—', endpoints.destination ? endpointRole(endpoints, 'destination') : 'Receiver cannot be derived from this packet')
     ]),
     field('http-headers', 'Headers', `${headers.length} fields`, 'Metadata carried by the application layer', headers),
     field('http-body', 'Payload', body || '(empty)', 'Application payload after the header terminator')
   ];
 }
 
-function parseTcpFields(raw: string): ProtocolField[] {
-  const [route = '', ...parts] = raw.split(' | ');
-  const [protocol, source = '—', arrow = '>', destination = '—'] = route.split(' ');
-  const values = new Map(parts.map((part) => {
+function parseTcpFields(raw: string, endpoints: EndpointInfo): ProtocolField[] {
+  const values = new Map(raw.split(' | ').slice(1).map((part) => {
     const separator = part.indexOf('=');
     return separator > -1 ? [part.slice(0, separator), part.slice(separator + 1)] : [part, 'true'];
   }));
@@ -88,11 +98,12 @@ function parseTcpFields(raw: string): ProtocolField[] {
       field('ethernet-type', 'Type', '0x0800 · IPv4', 'Network protocol identifier')
     ]),
     field('ipv4', 'Internet Layer', 'IPv4', 'Logical addressing and delivery', [
-      field('ipv4-source', 'Source', source, 'Origin IP and port'),
-      field('ipv4-destination', 'Destination', destination, 'Target IP and port'),
-      field('ipv4-protocol', 'Next Protocol', protocol || 'TCP', 'Transport protocol')
+      field('ipv4-source', 'Source', endpoints.rawSource ?? '—', endpoints.source ? `Origin IP and port (${endpointRole(endpoints, 'source')})` : endpoints.rawSource ? 'Raw route present but role unknown in simulated topology' : 'Cannot be derived: raw TCP route unparseable'),
+      field('ipv4-destination', 'Destination', endpoints.rawDestination ?? '—', endpoints.destination ? `Target IP and port (${endpointRole(endpoints, 'destination')})` : endpoints.rawDestination ? 'Raw route present but role unknown in simulated topology' : 'Cannot be derived: raw TCP route unparseable'),
+      field('ipv4-protocol', 'Next Protocol', 'TCP', 'Transport protocol')
     ]),
     field('tcp', 'Transport Layer', 'TCP', 'Reliable stream transport', [
+      field('tcp-direction', 'Direction', formatDirection(endpoints.direction), 'Derived solely from the raw TCP route'),
       field('tcp-seq', 'Sequence', values.get('Seq') ?? '—', 'Byte sequence position'),
       field('tcp-ack', 'Acknowledgement', values.get('Ack') ?? '—', 'Next expected byte'),
       field('tcp-flags', 'Flags', values.get('Flags') ?? '—', 'Control bits'),
@@ -103,17 +114,42 @@ function parseTcpFields(raw: string): ProtocolField[] {
   ];
 }
 
-function timelineFor(protocol: Protocol, scenario: PacketScenario): TimelineEvent[] {
+function formatDirection(direction: EndpointDirection): string {
+  if (direction === 'client-to-server') return 'client → server';
+  if (direction === 'server-to-client') return 'server → client';
+  return 'unknown';
+}
+
+function endpointRole(endpoints: EndpointInfo, side: 'source' | 'destination'): string {
+  if (endpoints.direction === 'unknown') return 'role unknown';
+  const isClient =
+    (side === 'source' && endpoints.direction === 'client-to-server') ||
+    (side === 'destination' && endpoints.direction === 'server-to-client');
+  return isClient ? 'simulated client' : 'simulated server';
+}
+
+function timelineFor(protocol: Protocol, endpoints: EndpointInfo): TimelineEvent[] {
   const prefix = protocol === 'HTTP' ? 'HTTP' : 'TCP';
+  const flow = formatDirection(endpoints.direction);
   const steps = protocol === 'HTTP'
     ? [
-        ['ingress', 'Frame captured', 'NIC received an application frame'],
-        ['parse', 'Headers indexed', 'Start line and header fields identified'],
-        ['application', `${prefix} payload decoded`, scenario === 'response' ? 'Response body is ready for inspection' : 'Request target and metadata extracted'],
+        ['ingress', 'Frame captured', endpoints.direction === 'unknown'
+          ? 'NIC received an application frame; endpoint direction unknown'
+          : `NIC received an application frame (${flow})`],
+        ['parse', 'Headers indexed', endpoints.direction === 'unknown'
+          ? 'Start line unrecognized; request/response role could not be determined'
+          : `Start line and header fields identified (${flow})`],
+        ['application', `${prefix} payload decoded`, endpoints.direction === 'server-to-client'
+          ? 'Response body is ready for inspection'
+          : endpoints.direction === 'client-to-server'
+            ? 'Request target and metadata extracted'
+            : 'Payload decoded, but message direction is unknown'],
         ['egress', 'Inspector ready', 'Structured representation emitted by parse API']
       ]
     : [
-        ['ingress', 'Segment captured', 'Transport segment received from the simulated wire'],
+        ['ingress', 'Segment captured', endpoints.direction === 'unknown'
+          ? 'Transport segment received from the simulated wire; endpoints not derivable from raw route'
+          : `Transport segment received from the simulated wire (${flow})`],
         ['transport', 'TCP header decoded', 'Sequence, acknowledgement and flags extracted'],
         ['parse', 'Layer tree assembled', 'Ethernet → IPv4 → TCP hierarchy created'],
         ['egress', 'Inspector ready', 'Structured representation emitted by parse API']
@@ -136,21 +172,29 @@ function checksum(raw: string): string {
 function buildPacket(protocol: Protocol, scenario: PacketScenario, raw: string): SimulatedPacket {
   const safeRaw = raw.trim() ? raw : (protocol === 'HTTP' ? HTTP_SAMPLES[scenario] : TCP_SAMPLES[scenario]);
   const isHttp = protocol === 'HTTP';
+  const endpoints = deriveEndpoints(protocol, safeRaw);
+  const httpRole = isHttp ? classifyHttpMessage(safeRaw) : null;
+  const httpRoleLabel = httpRole === 'response'
+    ? 'server response'
+    : httpRole === 'request'
+      ? 'client request'
+      : 'unknown HTTP message';
   return {
     id: `${protocol.toLowerCase()}-${scenario}-${Date.now().toString(36).slice(-6)}`,
     protocol,
     scenario,
     summary: isHttp
-      ? `${safeRaw.split(/\r?\n/)[0]} · ${scenario === 'response' ? 'server response' : 'client request'}`
-      : `${scenario === 'handshake' ? 'TCP connection handshake' : 'TCP data segment'} · ${safeRaw.split(' | ')[0]}`,
+      ? `${safeRaw.split(/\r?\n/)[0]} · ${httpRoleLabel}`
+      : `${scenario === 'handshake' ? 'TCP connection handshake' : 'TCP data segment'} · ${parseTcpRoute(safeRaw) ? `${endpoints.rawSource} > ${endpoints.rawDestination}` : 'route unknown'}`,
     raw: safeRaw,
     hex: hexDump(safeRaw),
-    fields: isHttp ? parseHttpFields(safeRaw) : parseTcpFields(safeRaw),
-    timeline: timelineFor(protocol, scenario),
+    fields: isHttp ? parseHttpFields(safeRaw, endpoints) : parseTcpFields(safeRaw, endpoints),
+    timeline: timelineFor(protocol, endpoints),
     metadata: {
       capturedAt: new Date().toISOString().replace('T', ' ').replace('Z', ' UTC'),
-      source: isHttp ? '10.0.0.24:51842' : safeRaw.split(' > ')[0].replace('TCP ', ''),
-      destination: isHttp ? '10.0.0.8:443' : (safeRaw.split(' > ')[1]?.split(' | ')[0] ?? '10.0.0.8:443'),
+      direction: endpoints.direction,
+      source: endpoints.source,
+      destination: endpoints.destination,
       length: Buffer.byteLength(safeRaw, 'utf8'),
       checksum: checksum(safeRaw)
     }
